@@ -20,6 +20,10 @@ interface NeverAgainListItem {
 class NeverAgain {
   private _markInstance: Mark;
   private _listNames: string[] = names;
+  private _mutationObserver: MutationObserver | null = null;
+  private _markingTimeout: number | null = null;
+  private _isMarking: boolean = false;
+  private _pendingElements: Set<HTMLElement> = new Set();
 
   public static data: NeverAgainListItem = namedData;
   public static docBody = document.getElementsByTagName('body')[0];
@@ -55,6 +59,9 @@ class NeverAgain {
   }
 
   public markAll(): void {
+    if (this._isMarking) return;
+    this._isMarking = true;
+
     const config: Mark.MarkOptions = {
       className: 'na-highlight',
       separateWordSearch: false,
@@ -62,9 +69,53 @@ class NeverAgain {
       diacritics: false,
       caseSensitive: true,
       each: NeverAgain.eachMark,
-      done: NeverAgain.afterMark,
+      done: () => {
+        this._isMarking = false;
+        NeverAgain.afterMark();
+      },
     };
     this._markInstance.mark(this._listNames, config);
+  }
+
+  public markChunked(chunkSize: number = 10): void {
+    if (this._isMarking) return;
+    this._isMarking = true;
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < this._listNames.length; i += chunkSize) {
+      chunks.push(this._listNames.slice(i, i + chunkSize));
+    }
+
+    let currentChunk = 0;
+    
+    const markNextChunk = () => {
+      if (currentChunk >= chunks.length) {
+        this._isMarking = false;
+        NeverAgain.afterMark();
+        return;
+      }
+
+      const config: Mark.MarkOptions = {
+        className: 'na-highlight',
+        separateWordSearch: false,
+        accuracy: 'exactly',
+        diacritics: false,
+        caseSensitive: true,
+        each: NeverAgain.eachMark,
+        done: () => {
+          currentChunk++;
+          if ('requestIdleCallback' in window) {
+            (window as any).requestIdleCallback(markNextChunk, { timeout: 1000 });
+          } else {
+            setTimeout(markNextChunk, 50);
+          }
+        },
+      };
+      
+      this._markInstance.mark(chunks[currentChunk], config);
+    };
+
+    markNextChunk();
   }
 
   public static updateTooltipLink(name: string | null) {
@@ -155,7 +206,138 @@ class NeverAgain {
     elem.popperRef.destroy();
     elem.popperRef = null;
   }
+
+  public observeDynamicContent(): void {
+    // Set up mutation observer for dynamic content
+    this._mutationObserver = new MutationObserver((mutations) => {
+      // Debounce marking to avoid performance issues
+      if (this._markingTimeout) {
+        clearTimeout(this._markingTimeout);
+      }
+      
+      // Collect elements that need marking
+      mutations.forEach(mutation => {
+        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+          mutation.addedNodes.forEach(node => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              this._pendingElements.add(node as HTMLElement);
+            }
+          });
+        }
+      });
+
+      this._markingTimeout = window.setTimeout(() => {
+        if (this._pendingElements.size > 0 && !this._isMarking) {
+          this._pendingElements.forEach(elem => {
+            const markInstance = new Mark(elem);
+            markInstance.mark(this._listNames, {
+              className: 'na-highlight',
+              separateWordSearch: false,
+              accuracy: 'exactly',
+              diacritics: false,
+              caseSensitive: true,
+              each: NeverAgain.eachMark,
+              done: NeverAgain.afterMark,
+            });
+          });
+          this._pendingElements.clear();
+        }
+      }, 1000); // Increased debounce for heavy sites
+    });
+
+    // Start observing
+    this._mutationObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: false // Disable character data to improve performance
+    });
+  }
+
+  public stopObserving(): void {
+    if (this._mutationObserver) {
+      this._mutationObserver.disconnect();
+      this._mutationObserver = null;
+    }
+    if (this._markingTimeout) {
+      clearTimeout(this._markingTimeout);
+      this._markingTimeout = null;
+    }
+    this._pendingElements.clear();
+  }
 }
 
-const neverAgain = new NeverAgain();
-neverAgain.markAll();
+// Global instance
+let neverAgain: NeverAgain | null = null;
+
+// Site-specific configuration
+const getSiteConfig = () => {
+  const hostname = window.location.hostname;
+  
+  // Heavy sites that need extra delay
+  const heavySites = [
+    'amazon.com',
+    'amazon.co.uk',
+    'amazon.de',
+    'amazon.fr',
+    'amazon.es',
+    'amazon.it',
+    'ebay.com',
+    'alibaba.com',
+    'walmart.com'
+  ];
+  
+  const isHeavySite = heavySites.some(site => hostname.includes(site));
+  
+  return {
+    initialDelay: isHeavySite ? 3000 : 1000,
+    useChunkedMarking: isHeavySite,
+    chunkSize: isHeavySite ? 5 : 10,
+    enableMutationObserver: !isHeavySite // Disable for heavy sites initially
+  };
+};
+
+// Initialize marking after DOM is ready
+function initializeMarking() {
+  const config = getSiteConfig();
+  
+  const performMarking = () => {
+    if (!neverAgain) {
+      neverAgain = new NeverAgain();
+    }
+    
+    if (config.useChunkedMarking) {
+      neverAgain.markChunked(config.chunkSize);
+    } else {
+      neverAgain.markAll();
+    }
+    
+    // Enable mutation observer after initial marking if configured
+    if (config.enableMutationObserver) {
+      setTimeout(() => {
+        neverAgain?.observeDynamicContent();
+      }, 2000);
+    }
+  };
+
+  if ('requestIdleCallback' in window) {
+    (window as any).requestIdleCallback(performMarking, { timeout: config.initialDelay });
+  } else {
+    setTimeout(performMarking, config.initialDelay);
+  }
+}
+
+// Wait for the right time to initialize
+if (document.readyState === 'complete') {
+  // Page is fully loaded
+  initializeMarking();
+} else if (document.readyState === 'interactive' || document.readyState === 'loading') {
+  // Wait for window load event for heavy sites
+  const config = getSiteConfig();
+  if (config.initialDelay >= 3000) {
+    window.addEventListener('load', () => {
+      setTimeout(initializeMarking, 500);
+    });
+  } else {
+    document.addEventListener('DOMContentLoaded', initializeMarking);
+  }
+}
