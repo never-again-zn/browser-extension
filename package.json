@@ -1,6 +1,6 @@
 {
   "name": "neveragain",
-  "version": "1.6",
+  "version": "1.7",
   "description": "A browser extension that highlights the products and brands related to apartheid Israel.",
   "source": "src/neverAgain.ts",
   "main": "dist/neverAgain.js",
